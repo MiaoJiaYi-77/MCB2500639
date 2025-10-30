@@ -1,0 +1,29 @@
+# YOLO11 数据集配置 - 表面缺陷检测
+# 比赛阶段：训练阶段（验证集未公布）
+
+# 数据集根目录
+path: data
+
+# 训练集和验证集配置
+# 【当前阶段 - 论文撰写】从训练集划分临时验证集进行模型开发
+# 运行: python split_dataset.py --mode split --ratio 0.2
+train: images/train  # 2640张 (从3300划分)
+val: images/val      # 660张 (从3300划分,用于调优)
+
+# 【官方验证集公布后的工作流程】
+# 1. 恢复训练集: python split_dataset.py --mode restore
+# 2. 使用全部3300张训练数据，用最佳配置重新训练模型
+# 3. 官方验证集放入 data/images/val（此时val指向官方验证集）
+# 4. 在官方验证集上预测并提交结果
+
+# 测试集（有标签，用于论文中报告性能）
+test: images/test  # 413张，作为Hold-out测试集
+
+# 类别配置
+nc: 3  # 类别数量
+
+# 类别名称（对应标注文件中的 0, 1, 2）
+names:
+  0: Dent   # 凹陷
+  1: Hole   # 破洞
+  2: Rusty  # 锈蚀

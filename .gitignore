@@ -1,0 +1,84 @@
+﻿# 数据集
+数据集3713/
+data/
+dataset/
+datasets/
+
+# 模型权重文件（超过 GitHub 100MB 限制）
+*.pt
+*.pth
+*.onnx
+*.pb
+*.h5
+*.hdf5
+
+# 检查点目录
+checkpoints_*/
+
+# 预处理数据
+preprocessed/
+
+# 运行结果
+runs/
+results/
+
+# 数据文件
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.bin
+*.tsv
+*.jsonl
+*.parquet
+*.feather
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+env/
+.venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+*.temp
+*.old
+*.sqlite
+*.db
