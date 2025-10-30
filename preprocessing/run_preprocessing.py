@@ -150,6 +150,9 @@ class PreprocessingPipeline:
                     "--preprocessed-root", str(self.output_root),
                     "--output-root", str(self.output_root),
                 ]
+                # 为避免在某些环境下自动估算batch size卡住，默认禁用自动估算并使用小的batch_size
+                # 这样可以保证特征提取步骤能够在低显存或有问题的环境下继续执行。
+                extra_args += ["--no-auto-batch", "--batch-size", "1"]
             elif step_id == 'dataset':
                 # 传入预处理根目录
                 extra_args += [

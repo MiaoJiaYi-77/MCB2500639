@@ -798,26 +798,46 @@ class ContainerImageEnhancer:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建子目录
+        # 创建子目录，使用 data/images/<split> 和 data/labels/<split> 结构，便于后续一键预处理使用
         for split in ['train', 'val', 'test']:
-            (output_dir / split / 'images').mkdir(parents=True, exist_ok=True)
-            (output_dir / split / 'labels').mkdir(parents=True, exist_ok=True)
+            (output_dir / 'images' / split).mkdir(parents=True, exist_ok=True)
+            (output_dir / 'labels' / split).mkdir(parents=True, exist_ok=True)
         
-        # 生成图像名称
+        # 生成图像名称：如果没有提供，则使用 image_000000 风格；
+        # 如果提供了相对路径（如 train/xxx），只保留文件名部分，避免保存时产生嵌套子目录
         if image_names is None:
             image_names = [f"image_{i:06d}" for i in range(len(images))]
+        else:
+            # 规范化提供的名称，保持唯一性但移除路径分隔符
+            norm_names = []
+            for n in image_names:
+                try:
+                    p = Path(n)
+                    name_only = p.with_suffix('').name
+                except Exception:
+                    name_only = str(n).replace('/', '_').replace('\\', '_')
+                norm_names.append(name_only)
+            image_names = norm_names
         
         # 数据集划分
         total_images = len(images)
         indices = list(range(total_images))
         random.shuffle(indices)
-        
-        train_end = int(total_images * split_ratio[0])
-        val_end = train_end + int(total_images * split_ratio[1])
-        
-        train_indices = indices[:train_end]
-        val_indices = indices[train_end:val_end]
-        test_indices = indices[val_end:]
+
+        # 说明：使用 int() 会向下取整，可能会产生余数。
+        # 原实现用两个 int() 切片，剩余的全部落到 test，这会导致 val/test 出现 412/414 这样的不对称。
+        # 这里显式计算三个 split 的样本数：先按比例取整 train 和 val，剩余样本分配给 test，保证三者之和等于 total_images。
+        train_count = int(total_images * split_ratio[0])
+        val_count = int(total_images * split_ratio[1])
+        test_count = total_images - train_count - val_count
+
+        # 切片索引
+        train_indices = indices[:train_count]
+        val_indices = indices[train_count:train_count + val_count]
+        test_indices = indices[train_count + val_count:]
+
+        # 记录分配信息（便于理解为何出现不均等）
+        logger.info(f"数据集切分细节: total={total_images}, train={train_count}, val={val_count}, test={test_count}")
         
         splits_indices = {
             'train': train_indices,
@@ -861,12 +881,14 @@ class ContainerImageEnhancer:
                             else:
                                 file_name = base_name
                             
-                            # 保存图像
-                            img_path = output_dir / split_name / 'images' / f"{file_name}.jpg"
+                            # 保存图像到 data/images/<split>/
+                            img_path = output_dir / 'images' / split_name / f"{file_name}.jpg"
+                            img_path.parent.mkdir(parents=True, exist_ok=True)
                             cv2.imwrite(str(img_path), enhanced_img)
                             
-                            # 保存标注
-                            label_path = output_dir / split_name / 'labels' / f"{file_name}.txt"
+                            # 保存标注到 data/labels/<split>/
+                            label_path = output_dir / 'labels' / split_name / f"{file_name}.txt"
+                            label_path.parent.mkdir(parents=True, exist_ok=True)
                             self.save_yolo_annotation(
                                 enhanced_bboxes,
                                 label_path,
@@ -995,9 +1017,9 @@ class ContainerImageEnhancer:
         
         yaml_content = {
             'path': str(output_dir.absolute()),
-            'train': 'train/images',
-            'val': 'val/images',
-            'test': 'test/images',
+            'train': 'images/train',
+            'val': 'images/val',
+            'test': 'images/test',
             'nc': len(class_names),
             'names': class_names,
             'stats': stats
@@ -1221,17 +1243,16 @@ def demo_dataset_generation():
     print(f"   ✓ 总计: {stats['total_generated']} 张")
 
     print("\n4. 数据集目录结构:")
-    print("   generated_dataset/")
-    print("   ├── train/")
-    print("   │   ├── images/")
-    print("   │   └── labels/")
-    print("   ├── val/")
-    print("   │   ├── images/")
-    print("   │   └── labels/")
-    print("   ├── test/")
-    print("   │   ├── images/")
-    print("   │   └── labels/")
-    print("   ├── dataset.yaml")
+    print("   data/")
+    print("   ├── images/")
+    print("   │   ├── train/")
+    print("   │   └── val/")
+    print("   │   └── test/")
+    print("   ├── labels/")
+    print("   │   ├── train/")
+    print("   │   └── val/")
+    print("   │   └── test/")
+    print("   ├── data.yaml")
     print("   └── statistics.json")
 
     print("\n5. 使用方法:")
