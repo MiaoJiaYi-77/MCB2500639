@@ -1,7 +1,10 @@
 """
-节点特征提取脚本（显存优化版）
-使用预训练的ResNet-50提取每个超像素的深度特征
-针对6GB显存优化：批量处理、混合精度、显存监控
+节点特征提取脚本（高性能优化版）
+针对RTX 4050 6GB + 16核CPU优化
+- 多进程数据预加载
+- 批量化特征提取
+- 向量化超像素处理
+- 显存动态管理
 """
 import torch
 import torch.nn as nn
@@ -18,10 +21,12 @@ import warnings
 import gc
 from datetime import datetime
 import logging
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing as mp
+from functools import partial
 
 warnings.filterwarnings('ignore')
 
-# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -54,18 +59,9 @@ def clear_gpu_memory():
 
 
 class SuperpixelDataset(Dataset):
-    """超像素数据集，用于批量加载"""
+    """超像素数据集，优化的批量加载"""
     
     def __init__(self, image_files, segment_files, info_files, transform=None):
-        """
-        初始化数据集
-        
-        参数:
-            image_files: 图像文件列表
-            segment_files: 超像素分割文件列表
-            info_files: 超像素信息文件列表
-            transform: 图像预处理转换
-        """
         self.image_files = image_files
         self.segment_files = segment_files
         self.info_files = info_files
@@ -81,9 +77,8 @@ class SuperpixelDataset(Dataset):
             raise ValueError(f"无法读取图像: {self.image_files[idx]}")
         
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        original_size = image.shape[:2]
         
-        # 加载超像素数据
+        # 加载超像素数据（延迟加载，节省内存）
         segments = np.load(self.segment_files[idx])
         
         with open(self.info_files[idx], 'r', encoding='utf-8') as f:
@@ -92,73 +87,55 @@ class SuperpixelDataset(Dataset):
         # 图像预处理
         if self.transform:
             image_tensor = self.transform(image_rgb)
-        else:
-            image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
         
         return {
             'image': image_tensor,
             'segments': segments,
             'sp_info': sp_info,
-            'original_size': original_size,
             'filename': self.image_files[idx].stem
         }
 
 
 class FeatureExtractor:
-    """ResNet特征提取器（显存优化版）"""
+    """ResNet特征提取器（高性能优化版）"""
     
-    def __init__(self, model_name='resnet50', layer_name='layer4', device='cuda', 
-                 use_amp=True, batch_size=4):
-        """
-        初始化特征提取器
-        
-        参数:
-            model_name: 模型名称 ('resnet50', 'resnet101')
-            layer_name: 提取特征的层 ('layer3', 'layer4')
-            device: 计算设备 ('cuda' or 'cpu')
-            use_amp: 是否使用混合精度（节省显存）
-            batch_size: 批处理大小
-        """
+    def __init__(self, model_name='resnet50', device='cuda', use_amp=True):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.use_amp = use_amp and torch.cuda.is_available()
-        self.batch_size = batch_size
         
         logger.info(f"使用设备: {self.device}")
         if self.use_amp:
-            logger.info("✓ 混合精度训练已启用 (节省显存)")
+            logger.info("✓ 混合精度训练已启用")
         
         # 显示GPU信息
         if torch.cuda.is_available():
             gpu_info = get_gpu_memory_info()
-            logger.info(f"GPU显存: {gpu_info['total']:.1f}MB 总计")
-            logger.info(f"可用显存: {gpu_info['free']:.1f}MB")
+            logger.info(f"GPU显存: {gpu_info['total']:.1f}MB 总计, {gpu_info['free']:.1f}MB 可用")
         
         # 加载预训练模型
         logger.info(f"加载模型: {model_name}...")
         if model_name == 'resnet50':
-            self.model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            weights = models.ResNet50_Weights.IMAGENET1K_V1
+            self.model = models.resnet50(weights=weights)
         elif model_name == 'resnet101':
-            self.model = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V1)
+            weights = models.ResNet101_Weights.IMAGENET1K_V1
+            self.model = models.resnet101(weights=weights)
         else:
             raise ValueError(f"不支持的模型: {model_name}")
         
-        # 移除最后的全连接层（不需要分类）
+        # 移除最后的全连接层和pooling层
         self.model = nn.Sequential(*list(self.model.children())[:-2])
-        
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # 如果有多GPU，使用DataParallel
-        if torch.cuda.device_count() > 1:
-            logger.info(f"检测到 {torch.cuda.device_count()} 个GPU，使用多GPU并行")
-            self.model = nn.DataParallel(self.model)
-        
-        self.layer_name = layer_name
+        # 禁用梯度计算，节省显存
+        for param in self.model.parameters():
+            param.requires_grad = False
         
         # 图像预处理
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((224, 224)),  # ResNet输入尺寸
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -168,207 +145,197 @@ class FeatureExtractor:
         
         logger.info("✓ 模型加载完成")
         
-    def extract_image_features(self, image_path):
-        """
-        提取整张图像的特征图
-        
-        参数:
-            image_path: 图像路径
-            
-        返回:
-            feature_map: 特征图 (C, H, W)
-            original_size: 原始图像尺寸 (H, W)
-        """
-        # 读取图像
-        image = cv2.imread(str(image_path))
-        if image is None:
-            raise ValueError(f"无法读取图像: {image_path}")
-        
-        original_size = image.shape[:2]  # (H, W)
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # 预处理
-        image_tensor = self.transform(image_rgb).unsqueeze(0).to(self.device)
-        
-        # 前向传播提取特征
+        # 预热模型
+        self._warmup()
+    
+    def _warmup(self):
+        """预热模型，优化后续推理速度"""
+        logger.info("预热模型...")
+        dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
         with torch.no_grad():
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    feature_map = self.model(image_tensor)
+                    _ = self.model(dummy_input)
             else:
-                feature_map = self.model(image_tensor)
-            
-            feature_map = feature_map.squeeze(0)  # (C, H_f, W_f)
-        
-        return feature_map, original_size
+                _ = self.model(dummy_input)
+        clear_gpu_memory()
+        logger.info("✓ 模型预热完成")
     
+    @torch.no_grad()
     def extract_batch_features(self, images):
-        """
-        批量提取图像特征
-        
-        参数:
-            images: 图像张量 (B, 3, H, W)
-            
-        返回:
-            features: 特征张量 (B, C, H_f, W_f)
-        """
+        """批量提取图像特征"""
         images = images.to(self.device)
         
-        with torch.no_grad():
-            if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    features = self.model(images)
-            else:
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
                 features = self.model(images)
+        else:
+            features = self.model(images)
         
         return features
     
-    def extract_superpixel_features_batch(self, image_path, segments, superpixel_info):
+    def extract_superpixel_features_vectorized(self, feature_map, segments, sp_info):
         """
-        为每个超像素提取特征向量（批量优化版）
+        向量化超像素特征提取（关键优化点）
         
         参数:
-            image_path: 图像路径
-            segments: 超像素分割数组 (H, W)
-            superpixel_info: 超像素信息字典
+            feature_map: 特征图 (C, H_f, W_f)
+            segments: 超像素分割 (H, W)
+            sp_info: 超像素信息
             
         返回:
-            node_features: 节点特征矩阵 (N, C)
+            node_features: (N, C)
         """
-        # 提取整张图像的特征图
-        feature_map, original_size = self.extract_image_features(image_path)
-        feature_map = feature_map.cpu().numpy()  # (C, H_f, W_f)
-        
         C, H_f, W_f = feature_map.shape
-        H_orig, W_orig = original_size
+        H_orig, W_orig = segments.shape
         
-        # 计算特征图和原图的缩放比例
+        # 计算缩放比例
         scale_h = H_f / H_orig
         scale_w = W_f / W_orig
         
-        num_superpixels = superpixel_info['num_superpixels']
+        num_superpixels = sp_info['num_superpixels']
+        
+        # 将segments缩放到特征图尺寸（使用最近邻插值）
+        segments_resized = cv2.resize(
+            segments.astype(np.float32), 
+            (W_f, H_f), 
+            interpolation=cv2.INTER_NEAREST
+        ).astype(np.int32)
+        
+        # 向量化提取：为每个超像素ID计算特征
         node_features = np.zeros((num_superpixels, C), dtype=np.float32)
         
-        # 为每个超像素提取特征
-        for sp in superpixel_info['superpixels']:
-            sp_id = sp['id']
-            
-            # 获取超像素的mask
-            mask = (segments == sp_id)
-            
-            # 获取超像素覆盖的像素坐标
-            coords = np.argwhere(mask)  # (N_pixels, 2) - (y, x)
-            
-            if len(coords) == 0:
+        # 重塑特征图为 (C, H_f*W_f)
+        feature_map_flat = feature_map.reshape(C, -1)
+        segments_flat = segments_resized.flatten()
+        
+        # 对每个超像素ID进行批量处理
+        unique_ids = np.unique(segments_flat)
+        for sp_id in unique_ids:
+            if sp_id < 0 or sp_id >= num_superpixels:
                 continue
             
-            # 将坐标映射到特征图
-            coords_scaled = coords.astype(np.float32)
-            coords_scaled[:, 0] = coords_scaled[:, 0] * scale_h  # y坐标
-            coords_scaled[:, 1] = coords_scaled[:, 1] * scale_w  # x坐标
-            coords_scaled = coords_scaled.astype(np.int32)
+            # 找到属于当前超像素的所有位置
+            mask = (segments_flat == sp_id)
             
-            # 限制坐标在特征图范围内
-            coords_scaled[:, 0] = np.clip(coords_scaled[:, 0], 0, H_f - 1)
-            coords_scaled[:, 1] = np.clip(coords_scaled[:, 1], 0, W_f - 1)
+            if mask.sum() == 0:
+                continue
             
-            # 从特征图中提取对应位置的特征
-            features_at_coords = feature_map[:, coords_scaled[:, 0], coords_scaled[:, 1]]  # (C, N_pixels)
-            
-            # 平均池化
-            sp_feature = np.mean(features_at_coords, axis=1)  # (C,)
-            
-            node_features[sp_id] = sp_feature
+            # 提取并平均这些位置的特征
+            sp_features = feature_map_flat[:, mask]  # (C, N_pixels)
+            node_features[sp_id] = sp_features.mean(axis=1)
         
         return node_features
     
     def get_feature_dim(self):
         """获取特征维度"""
-        return 2048  # ResNet layer4输出
+        return 2048  # ResNet50 layer4
 
 
-def estimate_batch_size(device, model, input_size=(3, 224, 224)):
+def collate_fn(batch):
+    """自定义collate函数，处理可变大小的数据"""
+    return batch
+
+
+def process_single_image(item, extractor, output_dir):
     """
-    自动估算合适的batch size
-    
-    参数:
-        device: 计算设备
-        model: 模型
-        input_size: 输入尺寸
+    处理单张图像（供多进程使用）
     
     返回:
-        optimal_batch_size: 最优batch size
+        success: 是否成功
+        info: 处理信息
     """
+    try:
+        filename = item['filename']
+        image = item['image']
+        segments = item['segments']
+        sp_info = item['sp_info']
+        
+        # 扩展batch维度
+        image_batch = image.unsqueeze(0)
+        
+        # 提取特征图
+        feature_map = extractor.extract_batch_features(image_batch)
+        feature_map = feature_map.squeeze(0).cpu().numpy()  # (C, H_f, W_f)
+        
+        # 向量化提取超像素特征
+        node_features = extractor.extract_superpixel_features_vectorized(
+            feature_map, segments, sp_info
+        )
+        
+        # 保存特征
+        feature_file = output_dir / f"{filename}_features.npy"
+        np.save(feature_file, node_features)
+        
+        return True, {
+            'name': filename,
+            'num_superpixels': sp_info['num_superpixels']
+        }
+        
+    except Exception as e:
+        return False, {
+            'name': item.get('filename', 'unknown'),
+            'error': str(e)
+        }
+
+
+def estimate_optimal_batch_size(device, model):
+    """智能估算最优batch size"""
     if not torch.cuda.is_available():
         return 1
     
-    logger.info("正在估算最优batch size...")
+    logger.info("智能估算最优batch size...")
+    clear_gpu_memory()
     
-    batch_size = 1
-    max_batch_size = 64
+    # 测试不同batch size的性能
+    test_sizes = [1, 2, 4, 8, 16, 32]
+    valid_sizes = []
     
-    try:
-        clear_gpu_memory()
-        
-        # 二分查找最大可用batch size
-        while batch_size < max_batch_size:
-            try:
-                test_batch = torch.randn(batch_size, *input_size).to(device)
-                with torch.no_grad():
-                    _ = model(test_batch)
-                
+    for bs in test_sizes:
+        try:
+            test_input = torch.randn(bs, 3, 224, 224).to(device)
+            with torch.no_grad():
+                _ = model(test_input)
+            valid_sizes.append(bs)
+            clear_gpu_memory()
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
                 clear_gpu_memory()
-                batch_size *= 2
-                
-            except RuntimeError as e:
-                if 'out of memory' in str(e):
-                    clear_gpu_memory()
-                    break
-                else:
-                    raise e
-        
-        # 使用找到的最大batch size的70%作为安全值
-        optimal_batch_size = max(1, batch_size // 2)
-        
-    except Exception as e:
-        logger.warning(f"batch size估算失败: {e}")
-        optimal_batch_size = 4
+                break
+            raise e
     
-    finally:
-        clear_gpu_memory()
+    # 选择最大可用batch size的75%作为安全值
+    if valid_sizes:
+        optimal = max(1, int(max(valid_sizes) * 0.75))
+    else:
+        optimal = 1
     
-    logger.info(f"✓ 最优batch size: {optimal_batch_size}")
-    return optimal_batch_size
+    logger.info(f"✓ 最优batch size: {optimal}")
+    return optimal
 
 
 def process_dataset_features(dataset_root, superpixel_root, output_root, 
-                             model_name='resnet50', layer_name='layer4',
-                             device='cuda', use_amp=True, batch_size=None,
-                             auto_batch_size=True, splits=None):
+                             model_name='resnet50', device='cuda', 
+                             use_amp=True, batch_size=None,
+                             num_workers=8, splits=None):
     """
-    为整个数据集提取特征（显存优化版）
+    为整个数据集提取特征（高性能优化版）
     
-    参数:
-        dataset_root: 数据集根目录(图像)
-        superpixel_root: 超像素数据根目录
-        output_root: 输出根目录
-        model_name: 模型名称
-        layer_name: 提取特征的层
-        device: 计算设备
-        use_amp: 是否使用混合精度
-        batch_size: 批处理大小（None则自动）
-        auto_batch_size: 是否自动估算batch size
-        splits: 要处理的数据集分割
+    关键优化：
+    1. 多进程数据加载 (DataLoader with num_workers)
+    2. 批量特征提取
+    3. 向量化超像素处理
+    4. 预加载和pin_memory
     """
     start_time = datetime.now()
     
     logger.info("=" * 60)
-    logger.info("节点特征提取（显存优化版）")
+    logger.info("节点特征提取（高性能优化版）")
     logger.info("=" * 60)
     logger.info(f"数据集路径: {dataset_root}")
     logger.info(f"超像素路径: {superpixel_root}")
     logger.info(f"输出路径: {output_root}")
-    logger.info(f"模型: {model_name}, 层: {layer_name}")
+    logger.info(f"CPU核心数: {mp.cpu_count()}, 使用workers: {num_workers}")
     logger.info("=" * 60)
     
     dataset_path = Path(dataset_root)
@@ -380,29 +347,18 @@ def process_dataset_features(dataset_root, superpixel_root, output_root,
     features_dir.mkdir(parents=True, exist_ok=True)
     
     # 初始化特征提取器
-    if batch_size is None:
-        batch_size = 4  # 默认值
-    
     extractor = FeatureExtractor(
         model_name=model_name,
-        layer_name=layer_name,
         device=device,
-        use_amp=use_amp,
-        batch_size=batch_size
+        use_amp=use_amp
     )
     
-    # 自动估算batch size
-    if auto_batch_size and torch.cuda.is_available():
-        optimal_batch_size = estimate_batch_size(
-            extractor.device, 
-            extractor.model,
-            input_size=(3, 224, 224)
-        )
-        batch_size = optimal_batch_size
-        extractor.batch_size = batch_size
+    # 估算最优batch size
+    if batch_size is None:
+        batch_size = estimate_optimal_batch_size(extractor.device, extractor.model)
     
     feature_dim = extractor.get_feature_dim()
-    logger.info(f"\n特征维度: {feature_dim}")
+    logger.info(f"特征维度: {feature_dim}")
     logger.info(f"批处理大小: {batch_size}")
     
     # 处理每个数据集分割
@@ -422,7 +378,7 @@ def process_dataset_features(dataset_root, superpixel_root, output_root,
         split_features_dir = features_dir / split
         split_features_dir.mkdir(parents=True, exist_ok=True)
         
-        # 获取所有超像素数据文件
+        # 收集所有文件路径
         segment_files = sorted(list(sp_dir.glob('*_segments.npy')))
         
         logger.info(f"\n处理 {split} 集: {len(segment_files)} 张图像")
@@ -431,81 +387,118 @@ def process_dataset_features(dataset_root, superpixel_root, output_root,
             logger.warning(f"{split} 集没有图像，跳过")
             continue
         
+        # 准备数据路径
+        image_files = []
+        info_files = []
+        
+        for seg_file in segment_files:
+            image_name = seg_file.stem.replace('_segments', '')
+            
+            # 查找图像文件
+            image_file = None
+            for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
+                candidate = images_dir / f"{image_name}{ext}"
+                if candidate.exists():
+                    image_file = candidate
+                    break
+            
+            if image_file is None:
+                continue
+            
+            info_file = sp_dir / f"{image_name}_info.json"
+            if not info_file.exists():
+                continue
+            
+            image_files.append(image_file)
+            info_files.append(info_file)
+        
+        # 创建数据集和数据加载器
+        dataset = SuperpixelDataset(
+            image_files,
+            segment_files[:len(image_files)],
+            info_files,
+            transform=extractor.transform
+        )
+        
+        # 关键优化：多进程数据加载
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True if torch.cuda.is_available() else False,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False
+        )
+        
         # 统计信息
         stats = {
-            'total_images': len(segment_files),
+            'total_images': len(image_files),
             'processed': 0,
             'failed': 0,
             'feature_dim': feature_dim,
-            'avg_superpixels': 0,
             'batch_size': batch_size,
-            'use_amp': use_amp
+            'num_workers': num_workers
         }
         
         total_superpixels = 0
         failed_images = []
         
-        # 清理显存
-        clear_gpu_memory()
+        # 批量处理
+        progress_bar = tqdm(dataloader, desc=f"提取{split}集特征")
         
-        # 处理每张图像
-        progress_bar = tqdm(segment_files, desc=f"提取{split}集特征")
-        for segment_file in progress_bar:
+        for batch_idx, batch_data in enumerate(progress_bar):
             try:
-                # 获取图像名称
-                image_name = segment_file.stem.replace('_segments', '')
+                # 批量提取特征
+                images = torch.stack([item['image'] for item in batch_data])
                 
-                # 加载超像素数据
-                segments = np.load(segment_file)
+                # 提取特征图
+                feature_maps = extractor.extract_batch_features(images)
+                feature_maps = feature_maps.cpu().numpy()  # (B, C, H_f, W_f)
                 
-                info_file = sp_dir / f"{image_name}_info.json"
-                with open(info_file, 'r', encoding='utf-8') as f:
-                    sp_info = json.load(f)
+                # 处理每张图像的超像素
+                for i, item in enumerate(batch_data):
+                    try:
+                        filename = item['filename']
+                        segments = item['segments']
+                        sp_info = item['sp_info']
+                        feature_map = feature_maps[i]  # (C, H_f, W_f)
+                        
+                        # 向量化提取超像素特征
+                        node_features = extractor.extract_superpixel_features_vectorized(
+                            feature_map, segments, sp_info
+                        )
+                        
+                        # 保存特征
+                        feature_file = split_features_dir / f"{filename}_features.npy"
+                        np.save(feature_file, node_features)
+                        
+                        stats['processed'] += 1
+                        total_superpixels += sp_info['num_superpixels']
+                        
+                    except Exception as e:
+                        logger.error(f"处理失败 {item['filename']}: {e}")
+                        stats['failed'] += 1
+                        failed_images.append({'name': item['filename'], 'error': str(e)})
                 
-                # 获取对应的图像文件，支持多种扩展名
-                image_file = None
-                for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
-                    candidate = images_dir / f"{image_name}{ext}"
-                    if candidate.exists():
-                        image_file = candidate
-                        break
-                
-                if image_file is None:
-                    logger.warning(f"找不到图像 {image_name}")
-                    stats['failed'] += 1
-                    failed_images.append({'name': image_name, 'error': '图像文件不存在'})
-                    continue
-                
-                # 提取超像素特征
-                node_features = extractor.extract_superpixel_features_batch(
-                    image_file, segments, sp_info
-                )
-                
-                # 保存特征
-                feature_file = split_features_dir / f"{image_name}_features.npy"
-                np.save(feature_file, node_features)
-                
-                stats['processed'] += 1
-                total_superpixels += sp_info['num_superpixels']
-                
-                # 每处理10张图像清理一次显存
-                if stats['processed'] % 10 == 0:
+                # 定期清理显存
+                if (batch_idx + 1) % 10 == 0:
                     clear_gpu_memory()
                     
-                    # 更新进度条信息
+                    # 更新进度条
                     if torch.cuda.is_available():
                         gpu_info = get_gpu_memory_info()
                         progress_bar.set_postfix({
-                            'GPU显存': f"{gpu_info['allocated']:.0f}MB",
+                            'GPU': f"{gpu_info['allocated']:.0f}MB",
                             '成功': stats['processed'],
                             '失败': stats['failed']
                         })
                 
             except Exception as e:
-                logger.error(f"处理失败 {segment_file.name}: {str(e)}")
-                stats['failed'] += 1
-                failed_images.append({'name': segment_file.name, 'error': str(e)})
-                clear_gpu_memory()  # 出错时清理显存
+                logger.error(f"批次处理失败: {e}")
+                stats['failed'] += len(batch_data)
+                clear_gpu_memory()
         
         # 计算统计信息
         if stats['processed'] > 0:
@@ -513,27 +506,22 @@ def process_dataset_features(dataset_root, superpixel_root, output_root,
         
         split_duration = (datetime.now() - split_start_time).total_seconds()
         stats['processing_time_seconds'] = split_duration
-        stats['images_per_second'] = len(segment_files) / split_duration if split_duration > 0 else 0
+        stats['images_per_second'] = stats['processed'] / split_duration if split_duration > 0 else 0
         stats['failed_images'] = failed_images
         
         # 打印统计信息
         logger.info(f"\n{split} 集处理完成:")
         logger.info(f"  成功处理: {stats['processed']} 张")
         logger.info(f"  处理失败: {stats['failed']} 张")
-        logger.info(f"  平均超像素数量: {stats['avg_superpixels']:.1f}")
-        logger.info(f"  特征维度: {stats['feature_dim']}")
+        logger.info(f"  平均超像素数量: {stats.get('avg_superpixels', 0):.1f}")
         logger.info(f"  处理时间: {split_duration:.2f} 秒")
         logger.info(f"  处理速度: {stats['images_per_second']:.2f} 张/秒")
-        
-        if stats['failed'] > 0:
-            logger.warning(f"  失败的图像: {[img['name'] for img in failed_images[:5]]}")
         
         # 保存统计信息
         stats_path = split_features_dir / 'stats.json'
         with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
         
-        # 清理显存
         clear_gpu_memory()
     
     total_duration = (datetime.now() - start_time).total_seconds()
@@ -541,44 +529,34 @@ def process_dataset_features(dataset_root, superpixel_root, output_root,
     logger.info("\n" + "=" * 60)
     logger.info("✓ 节点特征提取完成!")
     logger.info(f"总处理时间: {total_duration:.2f} 秒 ({total_duration/60:.2f} 分钟)")
-    logger.info(f"\n输出目录结构:")
-    logger.info(f"  {output_path}/")
-    logger.info(f"    └── node_features/")
-    logger.info(f"        ├── train/")
-    logger.info(f"        │   ├── *_features.npy (节点特征矩阵 N×{feature_dim})")
-    logger.info(f"        │   └── stats.json")
-    logger.info(f"        ├── val/")
-    logger.info(f"        └── test/")
     logger.info("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="为超像素提取ResNet特征（显存优化版）")
+    parser = argparse.ArgumentParser(description="节点特征提取（高性能优化版）")
     parser.add_argument('--data-root', type=str, default=str(Path(__file__).parent.parent / "data"),
-                        help='原始数据根目录（images/<split>）')
+                        help='原始数据根目录')
     parser.add_argument('--preprocessed-root', type=str, default=str(Path(__file__).parent.parent / "preprocessed"),
-                        help='预处理根目录（superpixels/node_features 等）')
+                        help='预处理根目录')
     parser.add_argument('--output-root', type=str, default=str(Path(__file__).parent.parent / "preprocessed"),
-                        help='输出根目录（通常与 preprocessed 相同）')
+                        help='输出根目录')
     parser.add_argument('--model-name', type=str, default='resnet50', choices=['resnet50','resnet101'],
-                        help='特征提取主干模型')
-    parser.add_argument('--layer-name', type=str, default='layer4', choices=['layer3','layer4'],
-                        help='提取的层')
-    parser.add_argument('--device', type=str, default='cuda', help='cuda 或 cpu')
+                        help='特征提取模型')
+    parser.add_argument('--device', type=str, default='cuda', help='计算设备')
     parser.add_argument('--use-amp', action='store_true', default=True,
-                        help='使用混合精度（节省显存）')
+                        help='使用混合精度')
     parser.add_argument('--no-amp', dest='use_amp', action='store_false',
                         help='不使用混合精度')
     parser.add_argument('--batch-size', type=int, default=None,
-                        help='批处理大小（None则自动估算）')
-    parser.add_argument('--no-auto-batch', action='store_false', dest='auto_batch_size',
-                        help='禁用自动batch size估算')
-    parser.add_argument('--split', type=str, default=None, help='单个分割名，如 test_noisy')
-    parser.add_argument('--splits', type=str, default=None, help='多个分割名，逗号分隔')
+                        help='批处理大小（None则自动）')
+    parser.add_argument('--num-workers', type=int, default=8,
+                        help='数据加载进程数（建议CPU核心数的50-75%）')
+    parser.add_argument('--split', type=str, default=None, help='单个分割')
+    parser.add_argument('--splits', type=str, default=None, help='多个分割（逗号分隔）')
 
     args = parser.parse_args()
 
-    # 解析 splits
+    # 解析splits
     splits = None
     if args.split:
         splits = [args.split]
@@ -590,10 +568,9 @@ if __name__ == "__main__":
         superpixel_root=Path(args.preprocessed_root),
         output_root=Path(args.output_root),
         model_name=args.model_name,
-        layer_name=args.layer_name,
         device=args.device,
         use_amp=args.use_amp,
         batch_size=args.batch_size,
-        auto_batch_size=args.auto_batch_size,
+        num_workers=args.num_workers,
         splits=splits
     )

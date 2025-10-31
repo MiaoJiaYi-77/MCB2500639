@@ -8,6 +8,7 @@
 """
 
 import os
+import shutil
 
 # 临时解决 OpenMP 重复加载问题（不安全，仅用于调试或临时运行）
 # 推荐的长期解决方案是确保所有数值/本机扩展使用同一 OpenMP 运行时来源（例如通过 conda 统一安装来自同一 channel 的包）。
@@ -921,6 +922,210 @@ class ContainerImageEnhancer:
         
         return stats
     
+    def generate_offline_dataset_v2(self,
+                                     images: List[np.ndarray],
+                                     bboxes: List[List[List[float]]],
+                                     output_dir: Union[str, Path],
+                                     image_names: Optional[List[str]] = None,
+                                     enhance_level: Union[EnhanceLevel, str] = EnhanceLevel.MODERATE,
+                                     split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+                                     augment_per_image: int = 1,
+                                     class_names: Optional[List[str]] = None,
+                                     respect_original_split: bool = True,
+                                     preserve_subdirs: bool = True,
+                                     random_seed: Optional[int] = None,
+                                     clean_output_dir: bool = False,
+                                     subdir_timestamp: bool = False) -> Dict:
+        """
+        生成离线数据集（改进版）：
+        - 可保留原始 train/val/test 划分（从 image_names 首段推断）
+        - 可按需保留子目录，避免同名覆盖
+        - 可设置随机种子，确保划分复现
+        - 可清空输出目录或写入时间戳子目录
+        """
+
+        # 1) 随机种子（可复现）
+        if random_seed is not None:
+            try:
+                random.seed(random_seed)
+                np.random.seed(random_seed)
+                try:
+                    torch.manual_seed(random_seed)
+                except Exception:
+                    pass
+                logger.info(f"使用随机种子: {random_seed}")
+            except Exception as e:
+                logger.warning(f"设置随机种子失败: {e}")
+
+        # 2) 输出目录处理（清空/时间戳）
+        root_output_dir = Path(output_dir)
+        if clean_output_dir and root_output_dir.exists():
+            logger.warning(f"将清空输出目录: {root_output_dir}")
+            try:
+                shutil.rmtree(root_output_dir)
+            except Exception as e:
+                logger.warning(f"清空输出目录失败: {e}")
+
+        if subdir_timestamp:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = root_output_dir / ts
+        else:
+            output_dir = root_output_dir
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for split in ['train', 'val', 'test']:
+            (output_dir / 'images' / split).mkdir(parents=True, exist_ok=True)
+            (output_dir / 'labels' / split).mkdir(parents=True, exist_ok=True)
+
+        # 3) 名称处理（可保留子目录，推断原始划分）
+        if image_names is None:
+            image_names = [f"image_{i:06d}" for i in range(len(images))]
+
+        processed_names: List[str] = []
+        name_splits: List[Optional[str]] = []
+        for n in image_names:
+            try:
+                p = Path(n)
+                as_posix_no_ext = p.with_suffix('').as_posix()
+            except Exception:
+                as_posix_no_ext = str(n).replace('\\', '/').split('.')[0]
+
+            parts = [seg for seg in as_posix_no_ext.split('/') if seg not in ('', '.')]
+            split_hint = parts[0] if parts else None
+            split_hint = split_hint if split_hint in {'train', 'val', 'test'} else None
+
+            if preserve_subdirs:
+                if split_hint and len(parts) > 1:
+                    rel_parts = parts[1:]
+                elif len(parts) > 0:
+                    rel_parts = parts
+                else:
+                    rel_parts = [as_posix_no_ext]
+                rel_name = '/'.join(rel_parts)
+            else:
+                rel_name = parts[-1] if parts else as_posix_no_ext
+
+            processed_names.append(rel_name)
+            name_splits.append(split_hint)
+
+        # 4) 划分（保留原始划分优先）
+        total_images = len(images)
+        indices = list(range(total_images))
+
+        train_indices: List[int] = []
+        val_indices: List[int] = []
+        test_indices: List[int] = []
+        unspecified_indices: List[int] = []
+
+        if respect_original_split:
+            for i, split_hint in enumerate(name_splits):
+                if split_hint == 'train':
+                    train_indices.append(i)
+                elif split_hint == 'val':
+                    val_indices.append(i)
+                elif split_hint == 'test':
+                    test_indices.append(i)
+                else:
+                    unspecified_indices.append(i)
+
+            if unspecified_indices:
+                tmp = unspecified_indices.copy()
+                random.shuffle(tmp)
+                u_total = len(tmp)
+                u_train = int(u_total * split_ratio[0])
+                u_val = int(u_total * split_ratio[1])
+                u_test = u_total - u_train - u_val
+                train_indices.extend(tmp[:u_train])
+                val_indices.extend(tmp[u_train:u_train + u_val])
+                test_indices.extend(tmp[u_train + u_val:])
+
+            logger.info(
+                f"保留原始划分: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}, 未指明={len(unspecified_indices)}"
+            )
+        else:
+            random.shuffle(indices)
+            train_count = int(total_images * split_ratio[0])
+            val_count = int(total_images * split_ratio[1])
+            test_count = total_images - train_count - val_count
+            train_indices = indices[:train_count]
+            val_indices = indices[train_count:train_count + val_count]
+            test_indices = indices[train_count + val_count:]
+            logger.info(
+                f"重新划分: total={total_images}, train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}"
+            )
+
+        splits_indices = {
+            'train': train_indices,
+            'val': val_indices,
+            'test': test_indices
+        }
+
+        stats = {
+            'total_original': total_images,
+            'total_generated': 0,
+            'train': 0,
+            'val': 0,
+            'test': 0,
+            'failed': 0
+        }
+
+        logger.info(f"开始生成数据集于 {output_dir}")
+        logger.info(f"数据集划分 - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+
+        # 5) 逐分割生成
+        for split_name, split_indices in splits_indices.items():
+            logger.info(f"\n处理 {split_name} 集...")
+            with tqdm(total=len(split_indices) * augment_per_image, desc=f"{split_name}集") as pbar:
+                for idx in split_indices:
+                    image = images[idx]
+                    image_bboxes = bboxes[idx] if idx < len(bboxes) else []
+                    base_name = processed_names[idx]
+
+                    for aug_idx in range(augment_per_image):
+                        try:
+                            enhanced_img, enhanced_bboxes = self._generate_dataset_sample(
+                                image, image_bboxes, enhance_level
+                            )
+
+                            if augment_per_image > 1:
+                                file_name = f"{base_name}_aug{aug_idx}"
+                            else:
+                                file_name = base_name
+
+                            img_path = output_dir / 'images' / split_name / f"{file_name}.jpg"
+                            img_path.parent.mkdir(parents=True, exist_ok=True)
+                            cv2.imwrite(str(img_path), enhanced_img)
+
+                            label_path = output_dir / 'labels' / split_name / f"{file_name}.txt"
+                            label_path.parent.mkdir(parents=True, exist_ok=True)
+                            self.save_yolo_annotation(
+                                enhanced_bboxes,
+                                label_path,
+                                enhanced_img.shape[1],
+                                enhanced_img.shape[0]
+                            )
+
+                            stats[split_name] += 1
+                            stats['total_generated'] += 1
+                        except Exception as e:
+                            logger.warning(f"处理 {base_name}_aug{aug_idx} 失败: {e}")
+                            stats['failed'] += 1
+                        pbar.update(1)
+
+        # 6) 保存配置与统计
+        self._save_dataset_yaml(output_dir, class_names, stats)
+        self._save_statistics(output_dir, stats)
+
+        logger.info("\n" + "="*80)
+        logger.info("数据集生成完成（v2）")
+        logger.info(f"输出目录: {output_dir}")
+        logger.info(f"总计生成: {stats['total_generated']} 张图像")
+        logger.info(f"Train: {stats['train']}, Val: {stats['val']}, Test: {stats['test']}")
+        logger.info(f"失败: {stats['failed']}")
+        logger.info("="*80)
+
+        return stats
+    
     def _generate_dataset_sample(self,
                                  image: np.ndarray,
                                  bboxes: List[List[float]],
@@ -1222,7 +1427,7 @@ def demo_dataset_generation():
     # 每张图像生成的增强样本数（可按需修改）
     augment_per_image = 1
 
-    stats = enhancer.generate_offline_dataset(
+    stats = enhancer.generate_offline_dataset_v2(
         images=images,
         bboxes=bboxes,
         output_dir=output_dir,
@@ -1230,7 +1435,12 @@ def demo_dataset_generation():
         enhance_level=EnhanceLevel.MODERATE,
         split_ratio=(0.8, 0.1, 0.1),
         augment_per_image=augment_per_image,
-        class_names=class_names
+        class_names=class_names,
+        respect_original_split=True,
+        preserve_subdirs=True,
+        random_seed=42,
+        clean_output_dir=False,
+        subdir_timestamp=True
     )
 
     # 显示结果

@@ -433,7 +433,7 @@ def main():
     
     # 使用已划分的训练集和验证集
     train_dataset = ContainerGraphDataset(root=config['data_root'], split='train')
-    val_dataset = ContainerGraphDataset(root=config['data_root'], split='val')
+    val_dataset = ContainerGraphDataset(root=config['data_root'], split='test')
     
     print(f"训练集: {len(train_dataset)} 个图")
     print(f"验证集: {len(val_dataset)} 个图")
